@@ -327,27 +327,316 @@ def run_verify(start_yyyymmdd: str, end_yyyymmdd: str,
     }
 
 
+# ── v0.4: auto_fix — 검증+자동 재다운+재적재 cycle ──
+def _import_innong():
+    """innong 의 agro/agro_db/markets.json 확보. apps/innong 가 형제 폴더라고 가정."""
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    innong_path = os.path.normpath(os.path.join(here, '..', 'innong'))
+    if innong_path not in sys.path:
+        sys.path.insert(0, innong_path)
+    import agro as innong_agro       # noqa: E402
+    import agro_db as innong_agro_db # noqa: E402
+    return innong_agro, innong_agro_db, innong_path
+
+
+def _load_market_map(innong_path: str) -> dict:
+    """markets.json (시장명 → 시장코드) 매핑."""
+    import json as _json
+    p = os.path.join(innong_path, 'markets.json')
+    with open(p, encoding='utf-8') as f:
+        markets = _json.load(f)
+    return {m['name']: m['code'] for m in markets}
+
+
+def auto_fix(start_ym: str = '201901', end_ym: str = '202604',
+             agro_root: str = DEFAULT_AGRO_ROOT,
+             threshold_pct: float = 5.0,
+             latest_first: bool = True,
+             dry_run: bool = False,
+             only_market_codes: list = None,
+             skip_market_codes: list = None,
+             download_unverifiable: bool = True,
+             log_cb=None,
+             stop_cb=None) -> dict:
+    """v0.4: 자동 검증 + 부족 시 재다운 + 재적재.
+
+    Args:
+      start_ym, end_ym: 'YYYYMM'
+      threshold_pct: 부족 판정 임계 (default 5%)
+      latest_first: 최신 월부터 역순 (default True)
+      dry_run: True 면 다운로드/적재 없이 부족 list 만 출력
+      download_unverifiable: agromarket 응답 0인 월도 무조건 다운 시도 (사용자 요청)
+
+    Flow per month:
+      1) compare_period 호출 → (시장,법인) 단위 비교
+      2) 시장 단위 합산 → 부족 시장 list (또는 amount=0 면 검증 불가)
+      3) 검증 가능 + 부족 → 재다운 + 재적재
+      4) 검증 불가 + download_unverifiable → 모든 시장 다운 시도 (스킵 인 daily DB 존재 일자 등)
+      5) 결과 누적
+    """
+    log = log_cb or print
+    from datetime import datetime
+    from calendar import monthrange
+    from collections import defaultdict
+    started = datetime.now()
+
+    # innong import
+    try:
+        innong_agro, innong_agro_db, innong_path = _import_innong()
+        market_map = _load_market_map(innong_path)
+    except Exception as ex:
+        log(f'❌ innong 모듈/markets.json 로드 실패: {ex}')
+        log(f'   innong 이 apps/innong 형제 폴더에 있어야 함')
+        return {'error': str(ex)}
+
+    log(f'🚀 auto_fix 시작 — {start_ym}~{end_ym}, '
+        f'{"최신순" if latest_first else "과거순"}, 임계 {threshold_pct}%')
+    log(f'   {"[DRY-RUN] 실제 다운/적재 X" if dry_run else "[REAL] 실제 진행"}')
+    log(f'   검증 불가 월 다운: {"ON" if download_unverifiable else "OFF"}')
+    log(f'   markets.json: {len(market_map)} 시장')
+    if only_market_codes:
+        log(f'   only_market_codes: {only_market_codes}')
+    if skip_market_codes:
+        log(f'   skip_market_codes: {skip_market_codes}')
+
+    # 월 list
+    sy, sm = int(start_ym[:4]), int(start_ym[4:6])
+    ey, em = int(end_ym[:4]),   int(end_ym[4:6])
+    months = []
+    cy, cm = sy, sm
+    while (cy, cm) <= (ey, em):
+        ms = f'{cy:04d}{cm:02d}01'
+        me = f'{cy:04d}{cm:02d}{monthrange(cy, cm)[1]:02d}'
+        months.append((f'{cy:04d}-{cm:02d}', ms, me))
+        cm += 1
+        if cm > 12: cy += 1; cm = 1
+    if latest_first:
+        months.reverse()
+    log(f'   대상: {len(months)} 개월')
+
+    downloader = None  # lazy init
+
+    summary = {
+        'start_ym': start_ym, 'end_ym': end_ym,
+        'months_total': len(months),
+        'months_processed': 0,
+        'months_verifiable': 0,
+        'months_unverifiable': 0,
+        'months_with_shortage': 0,
+        'shortage_market_pairs': 0,
+        'redownloads_attempted': 0,
+        'redownloads_failed': 0,
+        'reload_files': 0, 'reload_rows': 0,
+        'months_detail': [],
+        'started_at': started.isoformat(),
+        'dry_run': dry_run,
+    }
+
+    for i, (label, ms, me) in enumerate(months):
+        if stop_cb and stop_cb():
+            log('⏹ 사용자 중단'); break
+        log(f'\n━━ [{i+1}/{len(months)}] {label} ━━')
+
+        # 1) 비교
+        try:
+            cmp = compare_period(ms, me, agro_root=agro_root, threshold_pct=threshold_pct)
+        except Exception as ex:
+            log(f'  ⚠ 비교 실패: {ex}')
+            continue
+
+        # 2) 시장 단위 합산
+        by_market = defaultdict(lambda: {'r_amt': 0.0, 'l_amt': 0.0})
+        for d in cmp['rows']:
+            mk = d['market']
+            by_market[mk]['r_amt'] += d['remote_amt']
+            by_market[mk]['l_amt'] += d['local_amt']
+
+        total_remote = sum(v['r_amt'] for v in by_market.values())
+        verifiable = total_remote > 0
+        if verifiable:
+            summary['months_verifiable'] += 1
+        else:
+            summary['months_unverifiable'] += 1
+
+        # 3) 부족 시장 또는 검증 불가 시 처리 대상 결정
+        targets = []   # [(market_name, market_code, reason), ...]
+        if verifiable:
+            for mk, v in by_market.items():
+                if v['r_amt'] <= 0:
+                    continue
+                ratio = v['l_amt'] / v['r_amt'] * 100
+                if ratio < (100 - threshold_pct):
+                    mc = market_map.get(mk)
+                    if mc:
+                        targets.append((mk, mc, f'shortage {ratio:.1f}%'))
+                    else:
+                        log(f'    ⚠ {mk} → markets.json 매핑 없음, skip')
+        elif download_unverifiable:
+            # 모든 시장 다운 시도
+            for mk, mc in market_map.items():
+                targets.append((mk, mc, 'unverifiable, force download'))
+            log(f'  검증 불가 월 → {len(targets)} 시장 다운 시도')
+
+        # 시장 필터
+        if only_market_codes:
+            targets = [t for t in targets if t[1] in only_market_codes]
+        if skip_market_codes:
+            targets = [t for t in targets if t[1] not in skip_market_codes]
+
+        if verifiable and not targets:
+            log(f'  ✅ 검증 통과 (부족 시장 없음, 시장 {len(by_market)}, 합계 비율 '
+                f'{cmp["totals"]["amt_ratio_pct"]:.1f}%)')
+            summary['months_processed'] += 1
+            summary['months_detail'].append({'label': label, 'verifiable': True,
+                                              'shortage_count': 0,
+                                              'amt_ratio_pct': cmp['totals']['amt_ratio_pct']})
+            continue
+
+        if targets:
+            summary['months_with_shortage'] += 1 if verifiable else 0
+            summary['shortage_market_pairs'] += len(targets)
+            log(f'  📋 처리 대상 {len(targets)} 시장:')
+            for mk, mc, reason in targets[:8]:
+                log(f'    - [{mc}] {mk}  ({reason})')
+            if len(targets) > 8:
+                log(f'    - ... 외 {len(targets)-8}')
+
+        if dry_run:
+            log(f'  [DRY-RUN] 실제 다운/적재 skip')
+            summary['months_processed'] += 1
+            summary['months_detail'].append({'label': label, 'verifiable': verifiable,
+                                              'shortage_count': len(targets), 'dry_run': True})
+            continue
+
+        # 4) 재다운 + 재적재
+        if downloader is None:
+            log(f'  🌐 AgroDownloader 초기화 (Selenium Chrome)')
+            downloader = innong_agro.AgroDownloader(log_callback=log)
+
+        ms_dash = f'{ms[:4]}-{ms[4:6]}-{ms[6:]}'
+        me_dash = f'{me[:4]}-{me[4:6]}-{me[6:]}'
+
+        for mk, mc, reason in targets:
+            if stop_cb and stop_cb():
+                log('⏹ 중단'); break
+            log(f'  🔽 [{mc}] {mk} ({reason}) 재다운 중...')
+            files_received = []
+            def _cb(payload):
+                # payload = (xls_path, m_code, m_name)
+                files_received.append(payload)
+            try:
+                downloader.run_download_daily(
+                    start_date_str=ms_dash, end_date_str=me_dash,
+                    selected_codes=[mc],
+                    file_ready_cb=_cb,
+                    force_redownload=True,
+                )
+                summary['redownloads_attempted'] += 1
+            except Exception as ex:
+                log(f'    ❌ 다운 실패: {ex}')
+                summary['redownloads_failed'] += 1
+                continue
+
+            log(f'    📂 받은 XLS {len(files_received)} 개, 적재 중...')
+            for (xls_path, m_code, m_name) in files_received:
+                try:
+                    n = innong_agro_db.load_file_single(
+                        xls_path, m_code, m_name,
+                        force=True, logger=lambda s: None)
+                    if n > 0:
+                        summary['reload_files'] += 1
+                        summary['reload_rows'] += n
+                except Exception as ex:
+                    log(f'      ⚠ 적재 실패 {os.path.basename(xls_path)}: {ex}')
+
+        # 5) 재검증
+        try:
+            cmp2 = compare_period(ms, me, agro_root=agro_root, threshold_pct=threshold_pct)
+            log(f'  ↻ 재검증: 비율 {cmp2["totals"]["amt_ratio_pct"]:.1f}% '
+                f'(이전 {cmp["totals"]["amt_ratio_pct"]:.1f}%)')
+            summary['months_detail'].append({
+                'label': label, 'verifiable': verifiable,
+                'shortage_count': len(targets),
+                'before_ratio': cmp['totals']['amt_ratio_pct'],
+                'after_ratio':  cmp2['totals']['amt_ratio_pct'],
+            })
+        except Exception:
+            pass
+        summary['months_processed'] += 1
+
+    finished = datetime.now()
+    summary['finished_at'] = finished.isoformat()
+    summary['elapsed_sec'] = (finished - started).total_seconds()
+    log('')
+    log('=' * 70)
+    log(f'🎯 auto_fix 완료 — 소요 {summary["elapsed_sec"]:.0f}초')
+    log(f'   처리 월: {summary["months_processed"]}/{summary["months_total"]}')
+    log(f'   검증 가능 {summary["months_verifiable"]} / 불가 {summary["months_unverifiable"]}')
+    log(f'   부족 월 {summary["months_with_shortage"]} '
+        f'(시장 누적 {summary["shortage_market_pairs"]})')
+    log(f'   재다운 {summary["redownloads_attempted"]} '
+        f'(실패 {summary["redownloads_failed"]})')
+    log(f'   적재 파일 {summary["reload_files"]}, row {summary["reload_rows"]:,}')
+    return summary
+
+
 # ── CLI ──
 if __name__ == '__main__':
     import sys, argparse, json
     sys.stdout.reconfigure(encoding='utf-8')
-    ap = argparse.ArgumentParser(description='agroverify CLI — (시장, 법인) 단위 비교')
-    ap.add_argument('start', help='YYYYMMDD')
-    ap.add_argument('end',   help='YYYYMMDD')
-    ap.add_argument('--agro-root', default=DEFAULT_AGRO_ROOT)
-    ap.add_argument('--no-monthly', action='store_true', help='월별 분해 끄기')
-    ap.add_argument('--threshold', type=float, default=5.0)
-    ap.add_argument('--top-n', type=int, default=30, help='TOP N (시장,법인) 출력')
-    ap.add_argument('--output', help='결과 JSON 저장 경로')
+    ap = argparse.ArgumentParser(description='agroverify CLI')
+    sub = ap.add_subparsers(dest='cmd', required=False)
+
+    # 기본: verify (이전 동작)
+    p_v = sub.add_parser('verify', help='기간 검수만')
+    p_v.add_argument('start', help='YYYYMMDD')
+    p_v.add_argument('end',   help='YYYYMMDD')
+    p_v.add_argument('--agro-root', default=DEFAULT_AGRO_ROOT)
+    p_v.add_argument('--no-monthly', action='store_true')
+    p_v.add_argument('--threshold', type=float, default=5.0)
+    p_v.add_argument('--top-n', type=int, default=30)
+    p_v.add_argument('--output')
+
+    # auto-fix: 검증 + 재다운 + 재적재
+    p_a = sub.add_parser('auto-fix', help='자동 검증+재다운+재적재 cycle')
+    p_a.add_argument('start_ym', help='YYYYMM')
+    p_a.add_argument('end_ym',   help='YYYYMM')
+    p_a.add_argument('--agro-root', default=DEFAULT_AGRO_ROOT)
+    p_a.add_argument('--threshold', type=float, default=5.0)
+    p_a.add_argument('--oldest-first', action='store_true', help='과거 → 최신 (기본은 최신 → 과거)')
+    p_a.add_argument('--dry-run', action='store_true')
+    p_a.add_argument('--only-markets', nargs='+', help='특정 시장 코드만')
+    p_a.add_argument('--skip-markets', nargs='+', help='특정 시장 코드 제외')
+    p_a.add_argument('--no-download-unverifiable', action='store_true',
+                     help='검증 불가 월 다운 시도 끄기 (default ON)')
+    p_a.add_argument('--output', help='결과 JSON 저장 경로')
+
     args = ap.parse_args()
 
-    res = run_verify(args.start, args.end,
-                     agro_root=args.agro_root,
-                     with_monthly_breakdown=not args.no_monthly,
-                     threshold_pct=args.threshold,
-                     top_n_rows=args.top_n,
-                     log_cb=print)
-    if args.output:
+    if args.cmd == 'auto-fix':
+        res = auto_fix(args.start_ym, args.end_ym,
+                       agro_root=args.agro_root,
+                       threshold_pct=args.threshold,
+                       latest_first=not args.oldest_first,
+                       dry_run=args.dry_run,
+                       only_market_codes=args.only_markets,
+                       skip_market_codes=args.skip_markets,
+                       download_unverifiable=not args.no_download_unverifiable,
+                       log_cb=print)
+    else:
+        # default: verify
+        if args.cmd != 'verify':
+            # backward compat: 옛 호출 그대로 (positional start end)
+            args = ap.parse_args(['verify'] + sys.argv[1:])
+        res = run_verify(args.start, args.end,
+                         agro_root=args.agro_root,
+                         with_monthly_breakdown=not args.no_monthly,
+                         threshold_pct=args.threshold,
+                         top_n_rows=args.top_n,
+                         log_cb=print)
+
+    if getattr(args, 'output', None):
         out_p = os.path.abspath(args.output)
         os.makedirs(os.path.dirname(out_p), exist_ok=True)
         with open(out_p, 'w', encoding='utf-8') as f:

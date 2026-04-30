@@ -2,8 +2,8 @@
   "$schema": "limtools/app-manifest v1",
   "id": "agroverify",
   "name": "🔍 agroverify",
-  "version": "0.3.0",
-  "description": "agromarket.kr ↔ agro_data_v2 (시장, 법인) 단위 검수 (innong 독립)",
+  "version": "0.4.0",
+  "description": "agromarket.kr 검수 + 자동 재다운/재적재 cycle (innong 의 agro/agro_db 의존)",
 
   "entry": ["python", "run.py"],
 
