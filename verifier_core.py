@@ -292,6 +292,8 @@ if __name__ == '__main__':
                      agro_root=args.agro_root,
                      log_cb=print)
     if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
+        out_p = os.path.abspath(args.output)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True)
+        with open(out_p, 'w', encoding='utf-8') as f:
             json.dump(res, f, ensure_ascii=False, indent=2, default=str)
-        print(f'\n💾 결과 저장: {args.output}')
+        print(f'\n💾 결과 저장: {out_p}')
