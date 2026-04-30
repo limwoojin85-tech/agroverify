@@ -1,9 +1,9 @@
-﻿{
+{
   "$schema": "limtools/app-manifest v1",
   "id": "agroverify",
-  "name": "?뵇 agroverify",
+  "name": "🔍 agroverify",
   "version": "0.3.0",
-  "description": "agromarket.kr ???곕━ ?꾧뎅 DB(agro_data_v2) ?쇱옄蹂꽷룹떆?λ퀎 寃??(innong ?낅┰)",
+  "description": "agromarket.kr ↔ agro_data_v2 (시장, 법인) 단위 검수 (innong 독립)",
 
   "entry": ["python", "run.py"],
 
@@ -19,8 +19,7 @@
   "min_python": "3.11",
 
   "notes": {
-    "purpose": "innong 蹂몄껜? 遺꾨━??寃???꾩슜 GUI. agro_data_v2/daily/*.db 留?read.",
-    "no_corp_dim": "踰뺤씤 李⑥썝 ?쒓굅 (?ъ슜???붿껌) ???쒖옣횞?쇱옄 ?⑥쐞濡쒕쭔 鍮꾧탳"
+    "purpose": "innong 본체와 분리된 검수 전용 GUI. agro_data_v2/daily/*.db 만 read.",
+    "granularity": "(시장, 법인) 단위 비교 (사용자 요청 v0.3)"
   }
 }
-
