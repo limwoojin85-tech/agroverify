@@ -1,0 +1,25 @@
+{
+  "$schema": "limtools/app-manifest v1",
+  "id": "agroverify",
+  "name": "🔍 agroverify",
+  "version": "0.1.0",
+  "description": "agromarket.kr ↔ 우리 전국 DB(agro_data_v2) 일자별·시장별 검수 (innong 독립)",
+
+  "entry": ["python", "run.py"],
+
+  "python_venv": null,
+  "install_script": "install_setup.bat",
+  "run_script": "run.py",
+
+  "autostart_default": false,
+  "autostart_modes": [],
+
+  "tags": ["verify", "agro", "innong-companion"],
+
+  "min_python": "3.11",
+
+  "notes": {
+    "purpose": "innong 본체와 분리된 검수 전용 GUI. agro_data_v2/daily/*.db 만 read.",
+    "no_corp_dim": "법인 차원 제거 (사용자 요청) — 시장×일자 단위로만 비교"
+  }
+}
