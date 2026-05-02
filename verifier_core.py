@@ -141,10 +141,27 @@ def fetch_local_period_corp(start_yyyymmdd: str, end_yyyymmdd: str,
     return out
 
 
+def is_seafood_pair(market: str, corp: str) -> bool:
+    """수산 시장 또는 수산 법인 식별 (분석 대상 제외).
+
+    사용자 요구 2026-05-02: 농산물 분석만 → 수산 row 모두 제외.
+    조건:
+      - 시장명에 '수산' 포함 (예: '평촌수산')
+      - 법인명에 '수산' 포함 (예: '한밭수산(수산)', '평촌수산')
+    """
+    if '수산' in (market or ''): return True
+    if '수산' in (corp or ''):   return True
+    return False
+
+
 def compare_period(start_yyyymmdd: str, end_yyyymmdd: str,
                    agro_root: str = DEFAULT_AGRO_ROOT,
-                   threshold_pct: float = 5.0) -> dict:
+                   threshold_pct: float = 5.0,
+                   exclude_seafood: bool = True) -> dict:
     """기간 (시장, 법인) 단위 비교.
+
+    Args:
+      exclude_seafood: 수산 시장/법인 row 제외 (default True, 사용자 요구).
 
     Returns: {
       'period', 'totals': {remote_amt, local_amt, remote_qty, local_qty,
@@ -152,6 +169,7 @@ def compare_period(start_yyyymmdd: str, end_yyyymmdd: str,
       'rows': [{market, corp, remote_amt, local_amt, ..., flag}, ...],
               # 차이 절대값 큰 순
       'remote_meta', 'local_meta',
+      'excluded_seafood_count': N,
     }
     flag: 'ok' | 'short' | 'over' | 'missing' | 'orphan'
       missing : agromarket 에만 있음 (우리 누락) ★
@@ -166,6 +184,11 @@ def compare_period(start_yyyymmdd: str, end_yyyymmdd: str,
     lmeta  = local.pop('_meta', {})
 
     keys = set(remote.keys()) | set(local.keys())
+    n_excluded = 0
+    if exclude_seafood:
+        sf_keys = {k for k in keys if is_seafood_pair(k[0], k[1])}
+        n_excluded = len(sf_keys)
+        keys -= sf_keys
     rows = []
     tot_r_amt = tot_l_amt = 0.0
     tot_r_qty = tot_l_qty = 0.0
@@ -223,6 +246,7 @@ def compare_period(start_yyyymmdd: str, end_yyyymmdd: str,
         'flag_counts':  summary_flags,
         'remote_meta':  rmeta,
         'local_meta':   lmeta,
+        'excluded_seafood_count': n_excluded,
     }
 
 
