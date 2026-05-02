@@ -93,12 +93,18 @@ def fetch_remote_period_corp(start_yyyymmdd: str, end_yyyymmdd: str,
 
 
 def _iter_business_days(start_yyyymmdd: str, end_yyyymmdd: str):
+    """농수산물 도매시장 영업일 = 월~토 (일요일만 휴장).
+
+    버그 fix 2026-05-02: 이전 weekday<5 (월~금) 였던 게 토요일 거래 누락 →
+    월 단위 검증에서 ~15% 거짓 부족 발생. 토요일은 agromarket 통계에 포함되고
+    우리 DB 에도 적재되어 있어, 비교에서만 빠진 것이었음. 1자만 수정.
+    """
     sy, sm, sd = int(start_yyyymmdd[:4]), int(start_yyyymmdd[4:6]), int(start_yyyymmdd[6:8])
     ey, em, ed = int(end_yyyymmdd[:4]),   int(end_yyyymmdd[4:6]),   int(end_yyyymmdd[6:8])
     d = date(sy, sm, sd)
     end = date(ey, em, ed)
     while d <= end:
-        if d.weekday() < 5:
+        if d.weekday() < 6:  # 월~토 (일요일만 제외)
             yield d.strftime('%Y%m%d')
         d += timedelta(days=1)
 
